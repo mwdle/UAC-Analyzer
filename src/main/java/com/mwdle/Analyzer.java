@@ -5,7 +5,9 @@ import io.restassured.path.json.JsonPath;
 import io.restassured.response.Response;
 import org.json.JSONObject;
 
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -31,21 +33,38 @@ public class Analyzer {
     }
 
     /**
-     * Authenticates with the Jira instance
+     * Configures the Jira API URI and authentication.
      */
-    private static void authenticate() {
+    private static void configureJiraApi() {
         RestAssured.baseURI = env.getProperty("jira.host");
         RestAssured.authentication = RestAssured.preemptive().basic(env.getProperty("jira.user"), env.getProperty("jira.password"));
     }
 
     /**
-     * <a href="https://developer.atlassian.com/server/jira/platform/rest/v10002/intro/#structure">Jira REST API Documentation</a>
-     * @param jiraCode The Jira issue code (e.g. JIRA-1234)
+     * Exception class for Jira API errors
      */
-    private static Response loadJiraIssue(String jiraCode) {
-        return RestAssured.given().get("/rest/api/2/issue/" + jiraCode)
-                .then()
-                .statusCode(200).extract().response();
+    public static class JiraApiException extends Exception {
+        public JiraApiException(String message) {
+            super(message);
+        }
+    }
+
+    /**
+     * <a href="https://developer.atlassian.com/server/jira/platform/rest/v10002/intro/#structure">Jira REST API Documentation</a>
+     * Expects you to call the configureJiraApi() method prior to calling this method.
+     *
+     * @param jiraCode The Jira issue code (e.g. JIRA-1234)
+     * @return The Jira issue JSON object
+     */
+    private static Response loadJiraIssue(String jiraCode) throws JiraApiException {
+        try {
+            return RestAssured.given().get("/rest/api/2/issue/" + jiraCode)
+                    .then()
+                    .statusCode(200).extract().response();
+        }
+        catch (Exception e) {
+            throw new JiraApiException("Error loading Jira issue: " + jiraCode + "\nIs the Jira instance running?\nAre you connected to the VPN (if applicable)?\n");
+        }
     }
 
     /**
@@ -60,40 +79,97 @@ public class Analyzer {
      */
     private static String promptTemplate(String title, String description, int attachments, String issueType, String status, String comments) {
         return String.format("""
-                Analyze the following Jira issue and report whether it contains some user acceptance criteria to allow our QA team to validate the changes on the issue. The idea is to help us decide whether we need to ask the issue reporters to provide more information if necessary. \s
-                 Respond in JSON format: \s
+               Analyze the following Jira issue and report whether it contains adequate user acceptance criteria to allow members involved in the Agile pipeline to understand what is necessary to validate the changes on the issue. The idea is to help us decide whether we need to ask the issue reporters to provide more information if necessary.
+                 Respond in the following JSON format:
                
-                 { \s
-                   "contains_uac": "Yes" or "No", \s
-                   "should_manually_review": "Yes" or "No" \s
-                 } \s
+                 {"contains_uac": <boolean>, "should_manually_review": <boolean>}
                
-                 Guidelines: \s
-                 - If the issue clearly describes, implies, outlines, or references any sort of context, information, instructions, or attachments that seem to help out enough with giving the QA an idea of what is necessary, respond with {"contains_uac": "Yes"} \s
-                 - If the issue details are lacking in information and/or attachments, respond with {"contains_uac": "No"}. Use your judgment here -- the people involved in these issues generally have context already. \s
-                 - If you are unable to determine whether the issue contains user acceptance criteria and are confident that further review is warranted, respond with {"contains_uac": "?", "should_manually_review": "Yes"}. Use this option SPARINGLY, as the main point of this is to avoid having to perform a manual review. \s
-                 - Do NOT explain your answer under any circumstances. Respond only with RAW JSON. Do NOT wrap the JSON in any backticks or markdown. \s
+                 Guidelines:
+                 - If the issue clearly describes, implies, outlines, or references any sort of context, information, instructions, or attachments that seem to provide an idea of what is necessary, respond with {"contains_uac": true}
+                 - If the issue details are lacking in information and/or attachments and likely don't contain sufficient specific criteria for our QA team, respond with {"contains_uac": false}.
+                 - If you are unsure or unable to determine whether the issue contains user acceptance criteria and are confident that further review is warranted, respond with {"contains_uac": <boolean>, "should_manually_review": true}, otherwise respond with {"contains_uac": <boolean>, "should_manually_review": false}. Use this option SPARINGLY.
                
-                 Jira issue: \s
-                 Title: %s \s
-                 Description: %s \s
-                 Attachments: %s \s
-                 Issue Type: %s \s
-                 Status: %s \s
+                 Jira issue:
+                 Title: %s
+                 Description: %s
+                 Attachments: %s
+                 Issue Type: %s
+                 Status: %s
                  Comments: %s
                """, title, description, attachments, issueType, status, comments);
     }
 
     /**
+     * Creates the expected JSON response format for the LLM.
+     * @return The expected JSON response format
+     */
+    private static JSONObject expectedResponseFormat() {
+        JSONObject shouldManuallyReview = new JSONObject();
+        shouldManuallyReview.put("type", "boolean");
+        JSONObject containsUac = new JSONObject();
+        containsUac.put("type", "boolean");
+
+        JSONObject properties = new JSONObject();
+        properties.put("contains_uac", containsUac);
+        properties.put("should_manually_review", shouldManuallyReview);
+
+        JSONObject format = new JSONObject();
+        format.put("type", "object");
+        format.put("properties", properties);
+        return format;
+    }
+
+    /**
+     * Pulls the selected model on the ollama instance
+     * Prints the model pull progress
+     */
+    private static void pullModel(String model) {
+        JSONObject body = new JSONObject()
+                .put("model", model)
+                .put("stream", true);
+        System.out.print("Pulling the selected model: " + model);
+        Response response = RestAssured.given().baseUri(env.getProperty("ollama.host", "http://localhost:11434")).header("Content-Type", "application/json").body(body.toString()).post("/api/pull");
+        // Print the model pull progress
+        try(BufferedReader reader = new BufferedReader(new InputStreamReader(response.getBody().asInputStream()))) {
+            String line;
+            String currentDigest = "";
+            while ((line = reader.readLine()) != null) {
+                JSONObject progress = new JSONObject(line);
+                if (progress.has("total") && progress.has("completed")) {
+                    // Print a new progress bar line anytime the resource being pulled changes
+                    if (!progress.getString("digest").equals(currentDigest)) {
+                        currentDigest = progress.getString("digest");
+                        System.out.print("\n");
+                    }
+                    long completedInMB = progress.getLong("completed") / (1024 * 1024);
+                    long totalInMB = progress.getLong("total") / (1024 * 1024);
+                    double percentage = (completedInMB * 100.0) / totalInMB;
+                    System.out.printf("\r%s (%.2f%%) [%d MB/%d MB]", progress.getString("status"), percentage, completedInMB, totalInMB);
+                    System.out.flush();
+                }
+            }
+            System.out.print("\n\n");
+        } catch (IOException e) {
+            System.out.println("Failed to pull the model: " + model);
+            System.out.println("Error: " + e.getMessage());
+            System.out.println("Is the ollama instance running?");
+            System.exit(1);
+        }
+    }
+
+    /**
      * Queries the ollama instance with the provided prompt and returns the response
      * @param prompt The prompt to send to the LLM
-     * @return The response from the LLM
+     * @return The response from the LLM in the format defined in the expectedResponseFormat() method.
      */
     private static String queryLLM(String prompt) {
-        JSONObject body = new JSONObject();
-        body.put("model", env.getProperty("ollama.model", "mistral"));
-        body.put("prompt", prompt);
-        body.put("stream", false);
+        // Send the prompt to the LLM
+        System.out.println("Querying the LLM...");
+        JSONObject body = new JSONObject()
+                .put("model", env.getProperty("ollama.model", "mistral"))
+                .put("stream", false)
+                .put("prompt", prompt)
+                .put("format", expectedResponseFormat());
         Response response = RestAssured.given().baseUri(env.getProperty("ollama.host", "http://localhost:11434")).header("Content-Type", "application/json").body(body.toString()).post("/api/generate");
         return response.jsonPath().getString("response");
     }
@@ -119,19 +195,35 @@ public class Analyzer {
 
     public static void main(String[] args) {
         loadProperties();
-        authenticate();
-        System.out.print("Enter Jira issue code: ");
-        java.util.Scanner scanner = new java.util.Scanner(System.in);
-        String jiraCode = scanner.nextLine();
-        while (!jiraCode.matches("^[a-zA-Z]+-\\d+$")) {
-            System.out.println("Invalid Jira issue code: '" + jiraCode + "'");
-            System.out.print("Enter Jira issue code: ");
-            jiraCode = scanner.nextLine();
+        pullModel(env.getProperty("ollama.model", "mistral"));
+        boolean running = true;
+        while (running) {
+            System.out.print("Enter Jira issue code (or type 'exit' to quit): ");
+            java.util.Scanner scanner = new java.util.Scanner(System.in);
+            String jiraCode = scanner.nextLine();
+            if (jiraCode.equals("exit")) {
+                running = false;
+                continue;
+            }
+            while (!jiraCode.matches("^[a-zA-Z]+-\\d+$")) {
+                System.out.println("\nInvalid Jira issue code: '" + jiraCode + "'\n");
+                System.out.print("Enter Jira issue code: ");
+                jiraCode = scanner.nextLine();
+            }
+            configureJiraApi();
+            Response jiraIssue;
+            try {
+                jiraIssue = loadJiraIssue(jiraCode);
+            }
+            catch (JiraApiException e) {
+                System.out.println(e.getMessage());
+                continue;
+            }
+            String prompt = generatePrompt(jiraIssue.jsonPath());
+            RestAssured.reset(); // Reset the authentication so the Jira authentication headers are not sent with requests to the ollama instance.
+            String llmResponse = queryLLM(prompt);
+            System.out.println("Result: " + llmResponse);
+            System.out.print("\n");
         }
-        Response jiraIssue = loadJiraIssue(jiraCode);
-        String prompt = generatePrompt(jiraIssue.jsonPath());
-        String llmResponse = queryLLM(prompt);
-        System.out.print("\n");
-        System.out.println("Result: " + llmResponse);
     }
 }
