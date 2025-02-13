@@ -171,6 +171,8 @@ public class Analyzer {
                 .put("prompt", prompt)
                 .put("format", expectedResponseFormat());
         Response response = RestAssured.given().baseUri(env.getProperty("ollama.host", "http://localhost:11434")).header("Content-Type", "application/json").body(body.toString()).post("/api/generate");
+        if (response.jsonPath().getString("response") == null)
+            return response.getBody().asString();
         return response.jsonPath().getString("response");
     }
 
